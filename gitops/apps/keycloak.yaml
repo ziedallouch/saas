@@ -1,0 +1,138 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: erp-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: keycloak }
+  template:
+    metadata:
+      labels: { app: keycloak }
+    spec:
+      nodeSelector:
+        erp.devsty.io/role: apps
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.0.7
+          # `start`, not `start --optimized`. The stock quay image has no build baked
+          # in, so --optimized skips a step that has not happened and Keycloak fails
+          # to start with a build-time-option error. Plain `start` runs the build on
+          # boot — about 40 seconds, which is why the startup probe is generous.
+          # For production, build a custom image with `kc.sh build` and use --optimized.
+          args: ["start"]
+          env:
+            - name: KC_DB
+              value: postgres
+            # CNPG publishes <cluster>-rw as the writable endpoint.
+            - name: KC_DB_URL
+              value: jdbc:postgresql://keycloak-postgres-rw.erp-data.svc:5432/keycloak
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef: { name: keycloak-db-credentials, key: username }
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: keycloak-db-credentials, key: password }
+
+            # ingress-nginx terminates TLS. Keycloak must be told to trust the
+            # X-Forwarded-* headers, or every redirect it issues points at http://
+            # and the login flow breaks in a way that looks like a Keycloak bug.
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_HOSTNAME
+              value: https://keycloak.erp.lan
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_METRICS_ENABLED
+              value: "true"
+
+            # Single replica: use the local cache rather than Infinispan clustering.
+            # The default starts JGroups discovery, which costs memory and startup
+            # time and finds nothing.
+            - name: KC_CACHE
+              value: local
+
+            # An explicit heap cap, not MaxRAMPercentage. Keycloak's container
+            # default takes ~70% of the limit for heap alone, and then metaspace,
+            # thread stacks and direct buffers push the process past the limit —
+            # which reads as a mysterious OOMKill rather than a heap problem.
+            - name: JAVA_OPTS_APPEND
+              value: "-Xms256m -Xmx768m -XX:MaxMetaspaceSize=192m"
+
+            # Keycloak 26 renamed these from KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD.
+            # If you pin a different major version, check the names before debugging
+            # a Keycloak that starts with no admin account.
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef: { name: keycloak-bootstrap-admin, key: username }
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: keycloak-bootstrap-admin, key: password }
+
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9000
+              name: management
+
+          # 768m heap + ~192m metaspace + threads and direct buffers ≈ 1.1 Gi.
+          resources:
+            requests: { cpu: "300m", memory: "896Mi" }
+            limits:   { memory: "1280Mi" }
+
+          # Health endpoints moved to the management port (9000) in Keycloak 25+.
+          startupProbe:
+            httpGet: { path: /health/started, port: 9000 }
+            failureThreshold: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 9000 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health/live, port: 9000 }
+            periodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: erp-apps
+spec:
+  selector: { app: keycloak }
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  namespace: erp-apps
+  annotations:
+    cert-manager.io/cluster-issuer: erp-ca
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [keycloak.erp.lan]
+      secretName: keycloak-tls
+  rules:
+    - host: keycloak.erp.lan
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port: { number: 8080 }

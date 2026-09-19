@@ -1,0 +1,93 @@
+---
+# Redis holds entitlement and permission caches and nothing else. Losing it costs a
+# burst of resolution calls against erp-platform-core, not data — so no persistence,
+# no replication, no chart. A Deployment with an emptyDir is the honest shape.
+#
+# Eviction is safe here for the same reason: a missing key is a cache miss, and the
+# gateway's fallback path handles it. Nothing in this system ever fails open because
+# Redis was empty.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: erp-data
+data:
+  redis.conf: |
+    appendonly no
+    save ""
+    maxmemory 192mb
+    maxmemory-policy allkeys-lru
+    timeout 0
+    tcp-keepalive 300
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: erp-data
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      nodeSelector:
+        erp.devsty.io/role: data
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args:
+            - /etc/redis/redis.conf
+            - --requirepass
+            - $(REDIS_PASSWORD)
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+          ports:
+            - containerPort: 6379
+              name: redis
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis
+            - name: data
+              mountPath: /data
+          resources:
+            requests: { cpu: "50m", memory: "96Mi" }
+            limits:   { memory: "256Mi" }   # maxmemory + headroom; OOMKill otherwise
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+        - name: data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: erp-data
+spec:
+  selector: { app: redis }
+  ports:
+    - port: 6379
+      targetPort: 6379
+      name: redis

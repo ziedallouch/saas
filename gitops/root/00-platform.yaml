@@ -1,0 +1,113 @@
+---
+# Platform controllers. Sync wave -2: everything else depends on these CRDs existing.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cert-manager
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  project: default
+  source:
+    repoURL: https://charts.jetstack.io
+    chart: cert-manager
+    targetRevision: v1.16.2
+    helm:
+      values: |
+        crds:
+          enabled: true
+        nodeSelector:
+          erp.devsty.io/role: apps
+        resources:
+          requests: { cpu: 20m, memory: 48Mi }
+          limits:   { memory: 128Mi }
+        webhook:
+          nodeSelector:
+            erp.devsty.io/role: apps
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { memory: 96Mi }
+        cainjector:
+          nodeSelector:
+            erp.devsty.io/role: apps
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits:   { memory: 160Mi }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cert-manager
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ingress-nginx
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  project: default
+  source:
+    repoURL: https://kubernetes.github.io/ingress-nginx
+    chart: ingress-nginx
+    targetRevision: 4.12.0
+    helm:
+      values: |
+        controller:
+          kind: DaemonSet          # two nodes; a DaemonSet means either node IP works
+          service:
+            type: LoadBalancer     # k3s ServiceLB binds host ports 80/443
+          nodeSelector:
+            kubernetes.io/os: linux
+          config:
+            # The gateway needs the caller's real address for rate limiting and audit.
+            use-forwarded-headers: "true"
+            # Keycloak cookies and JWTs are large; the default 4k buffer drops them.
+            proxy-buffer-size: "16k"
+          allowSnippetAnnotations: false
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits:   { memory: 256Mi }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ingress-nginx
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cnpg-operator
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  project: default
+  source:
+    repoURL: https://cloudnative-pg.github.io/charts
+    chart: cloudnative-pg
+    targetRevision: 0.23.0
+    helm:
+      values: |
+        nodeSelector:
+          erp.devsty.io/role: apps
+        resources:
+          requests: { cpu: 50m, memory: 96Mi }
+          limits:   { memory: 192Mi }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cnpg-system
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

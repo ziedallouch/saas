@@ -1,0 +1,24 @@
+# Never commit these.
+kubeconfig
+ansible/inventory/hosts.yml
+sealed-secrets.pem
+sealed-secrets-key.yaml
+*.crt
+*.key
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
+# Anything accidentally left unsealed
+**/unsealed-*.yaml
+
+# Staged k3s binary (70 MB)
+.cache/
+
+# Scratch scripts for this build session
+.tmp/

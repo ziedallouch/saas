@@ -1,0 +1,397 @@
+---
+# Installs k3s on the two RHEL-family VMs and fetches a kubeconfig to ./kubeconfig.
+#
+#   ansible-galaxy collection install -r ansible/requirements.yml
+#   ansible-playbook -i ansible/inventory/hosts.yml ansible/site.yml
+#
+# Idempotent: re-running is safe, and is how you roll a version bump.
+
+- name: Prepare all nodes
+  hosts: all
+  gather_facts: true
+  tasks:
+
+    ###########################################################################
+    # Cloned-VM repair.
+    #
+    # Both VMs answer with the same SSH host key fingerprint and both are named
+    # "localhost", so node-2 is a clone of node-1. Three things must differ
+    # before k3s will work:
+    #   - hostname: k3s derives the node name from it. Two nodes both called
+    #     "localhost" collide, and the second one never joins cleanly.
+    #   - /etc/machine-id: systemd and some CNI paths key off it.
+    #   - SSH host keys: sharing a private host key across machines means either
+    #     host can impersonate the other to anyone who trusts the fingerprint.
+    ###########################################################################
+
+    - name: Set the hostname
+      ansible.builtin.hostname:
+        name: "{{ node_hostname }}"
+
+    - name: Record all cluster members in /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "^{{ hostvars[item].ansible_host }}\\s"
+        line: "{{ hostvars[item].ansible_host }} {{ hostvars[item].node_hostname }}"
+        state: present
+      loop: "{{ groups['all'] }}"
+
+    - name: Check whether machine-id is shared between the two VMs
+      ansible.builtin.slurp:
+        src: /etc/machine-id
+      register: machine_id_raw
+
+    - name: Report machine-id
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} machine-id = {{ machine_id_raw.content | b64decode | trim }}
+          — if these match across hosts, run the regeneration task below.
+
+    # Left as an explicit, non-default action: regenerating machine-id on a running
+    # host can confuse systemd units mid-flight. Run once, then reboot.
+    - name: Regenerate machine-id (only when -e regenerate_identity=true)
+      when: regenerate_identity | default(false) | bool
+      block:
+        - name: Clear machine-id
+          ansible.builtin.copy:
+            dest: /etc/machine-id
+            content: ""
+            mode: "0444"
+
+        - name: Recreate machine-id
+          ansible.builtin.command: systemd-machine-id-setup
+          changed_when: true
+
+        - name: Remove cloned SSH host keys
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/ssh/ssh_host_rsa_key
+            - /etc/ssh/ssh_host_rsa_key.pub
+            - /etc/ssh/ssh_host_ecdsa_key
+            - /etc/ssh/ssh_host_ecdsa_key.pub
+            - /etc/ssh/ssh_host_ed25519_key
+            - /etc/ssh/ssh_host_ed25519_key.pub
+
+        - name: Regenerate SSH host keys
+          ansible.builtin.command: ssh-keygen -A
+          changed_when: true
+          notify: Restart sshd
+
+    ###########################################################################
+    # Packages and kernel
+    ###########################################################################
+
+    - name: Install prerequisites
+      ansible.builtin.package:
+        name:
+          - curl
+          - tar
+          - iptables
+          - nfs-utils          # RHEL family; not nfs-common
+          - container-selinux  # required before k3s-selinux installs cleanly
+          - policycoreutils-python-utils
+        state: present
+
+    # The k3s installer normally pulls k3s-selinux from rpm.rancher.io itself, but it
+    # skips that step whenever INSTALL_K3S_SKIP_DOWNLOAD is set — which is exactly what
+    # the agent play now does to avoid re-downloading the 70 MB binary. Under SELinux
+    # enforcing that would leave the agent without the policy, and the resulting denials
+    # surface later as containers failing for reasons that look unrelated. So install it
+    # explicitly here, pinned, so both nodes carry the same policy either way.
+    - name: Install the k3s SELinux policy
+      when: ansible_selinux.status | default('disabled') == 'enabled'
+      ansible.builtin.dnf:
+        name: "{{ k3s_selinux_rpm }}"
+        state: present
+
+    - name: Disable swap at runtime
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+      # Swap is off because the kubelet's memory accounting assumes it. On a 4 GB
+      # node, swap turns an OOMKill — loud, obvious, one pod — into everything
+      # being slow, which is far harder to diagnose.
+
+    - name: Comment out swap entries in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(?!#)(.*\sswap\s+.*)$'
+        replace: '# \1'
+
+    - name: Load required kernel modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: [br_netfilter, overlay]
+
+    - name: Persist kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k3s.conf
+        content: |
+          br_netfilter
+          overlay
+        mode: "0644"
+
+    - name: Sysctl for bridged and forwarded traffic
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-k3s.conf
+        reload: true
+      loop:
+        - { key: net.bridge.bridge-nf-call-iptables, value: "1" }
+        - { key: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+        - { key: net.ipv4.ip_forward, value: "1" }
+
+    ###########################################################################
+    # firewalld
+    #
+    # RHEL ships firewalld enabled, and it silently breaks a k3s cluster in a
+    # confusing way: the node joins, pods start, and cross-node traffic vanishes
+    # because VXLAN (8472/udp) is dropped. Trusting the pod and service CIDRs is
+    # what the k3s docs recommend for RHEL.
+    ###########################################################################
+
+    - name: Is firewalld running?
+      ansible.builtin.command: systemctl is-active firewalld
+      register: firewalld_state
+      changed_when: false
+      failed_when: false
+
+    - name: Configure firewalld for k3s
+      when: firewalld_state.stdout == "active"
+      block:
+        - name: Trust the pod and service networks
+          ansible.posix.firewalld:
+            source: "{{ item }}"
+            zone: trusted
+            permanent: true
+            immediate: true
+            state: enabled
+          loop:
+            - "{{ k3s_cluster_cidr }}"
+            - "{{ k3s_service_cidr }}"
+
+        - name: Open cluster ports
+          ansible.posix.firewalld:
+            port: "{{ item }}"
+            permanent: true
+            immediate: true
+            state: enabled
+          loop:
+            - 6443/tcp    # Kubernetes API
+            - 10250/tcp   # kubelet (metrics, exec, logs)
+            - 8472/udp    # flannel VXLAN
+            - 80/tcp      # ingress-nginx
+            - 443/tcp     # ingress-nginx
+
+        - name: Reload firewalld
+          ansible.builtin.command: firewall-cmd --reload
+          changed_when: true
+
+    - name: Report SELinux mode
+      ansible.builtin.debug:
+        msg: >-
+          SELinux is {{ ansible_selinux.status | default('unknown') }}
+          ({{ ansible_selinux.mode | default('n/a') }}).
+          The k3s installer pulls k3s-selinux from rpm.rancher.io; if these VMs
+          have no internet access that step fails and k3s will not start under
+          enforcing mode.
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+- name: Install k3s server
+  hosts: k3s_server
+  gather_facts: false
+  tasks:
+    # Download to a file, then execute it.
+    #
+    # NOT `curl -sfL https://get.k3s.io | sh -s -`, which is what the k3s docs show
+    # for interactive use. Two reasons it is wrong here:
+    #   - `sh -s` reads the script from stdin, so stdin IS the script. Anything the
+    #     installer runs that touches stdin parks the shell on a read that never
+    #     returns: no child process, no CPU, no progress, forever.
+    #   - If curl fails, sh gets empty input and exits 0, so Ansible reports success
+    #     on a k3s that was never installed, and the failure surfaces later as a
+    #     mysterious timeout waiting for port 6443.
+    - name: Download the k3s installer
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /root/k3s-install.sh
+        mode: "0755"
+        timeout: 60
+
+    - name: Run the k3s installer (server)
+      ansible.builtin.command:
+        cmd: /root/k3s-install.sh
+        creates: /etc/systemd/system/k3s.service
+      environment:
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+        # traefik is disabled because ingress-nginx is installed via ArgoCD.
+        # metrics-server is disabled because nothing needs it yet, and it costs ~100 MB.
+        INSTALL_K3S_EXEC: >-
+          server
+          --disable traefik
+          --disable metrics-server
+          --write-kubeconfig-mode 0644
+          --cluster-cidr {{ k3s_cluster_cidr }}
+          --service-cidr {{ k3s_service_cidr }}
+          --advertise-address {{ k3s_api_host }}
+          --node-name {{ node_hostname }}
+          {% for san in k3s_tls_san %}--tls-san {{ san }} {% endfor %}
+          {% for k, v in node_labels.items() %}--node-label {{ k }}={{ v }}{% if not loop.last %} {% endif %}{% endfor %}
+
+    - name: Wait for the API server
+      ansible.builtin.wait_for:
+        port: 6443
+        host: "{{ k3s_api_host }}"
+        timeout: 300
+
+    - name: Read the node token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_node_token_raw
+      no_log: true
+
+    - name: Publish the token to other plays
+      ansible.builtin.set_fact:
+        k3s_node_token: "{{ k3s_node_token_raw.content | b64decode | trim }}"
+      no_log: true
+
+    - name: Read the generated kubeconfig
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: k3s_kubeconfig_raw
+
+    - name: Write kubeconfig to the repo root, pointed at the real API address
+      ansible.builtin.copy:
+        content: >-
+          {{ k3s_kubeconfig_raw.content | b64decode
+             | replace('127.0.0.1', k3s_api_host)
+             | replace('default', 'erp-nonprod') }}
+        dest: "{{ playbook_dir }}/../kubeconfig"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+- name: Install k3s agent
+  hosts: k3s_agent
+  gather_facts: false
+  vars:
+    k3s_server_host: "{{ groups['k3s_server'][0] }}"
+    k3s_binary_cache: "{{ playbook_dir }}/../.cache/k3s-{{ k3s_version }}"
+  tasks:
+
+    ###########################################################################
+    # Get the binary from node-1 instead of downloading it again.
+    #
+    # The link from these VMs to GitHub runs at roughly 115 KB/s, so fetching
+    # the 70 MB k3s binary a second time costs ~10 minutes. The server node
+    # already has a copy that has been verified and is known to run. Copying it
+    # across the LAN is faster, and it is the only way to *guarantee* both
+    # nodes run byte-identical binaries rather than merely the same version tag.
+    #
+    # If the server binary is missing for any reason, fall back to letting the
+    # installer download it — slow, but the play still completes.
+    ###########################################################################
+
+    - name: Checksum the k3s binary on the server node
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: server_k3s
+      delegate_to: "{{ k3s_server_host }}"
+
+    - name: Report which path will be taken
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Copying k3s from ' ~ k3s_server_host ~ ' (sha256 ' ~ server_k3s.stat.checksum ~ ')'
+             if server_k3s.stat.exists
+             else 'No binary on ' ~ k3s_server_host ~ ' — the installer will download it (~10 min on this link)' }}
+
+    - name: Stage and copy the server's binary
+      when: server_k3s.stat.exists
+      block:
+        - name: Stage the binary on the controller
+          ansible.builtin.fetch:
+            src: /usr/local/bin/k3s
+            dest: "{{ k3s_binary_cache }}"
+            flat: true
+          delegate_to: "{{ k3s_server_host }}"
+
+        - name: Place the binary on the agent
+          ansible.builtin.copy:
+            src: "{{ k3s_binary_cache }}"
+            dest: /usr/local/bin/k3s
+            mode: "0755"
+            owner: root
+            group: root
+
+        # copy's own checksum is SHA-1, so verify SHA-256 explicitly: this is the
+        # check that the two nodes really are running the same bytes.
+        - name: Re-read the agent's binary checksum
+          ansible.builtin.stat:
+            path: /usr/local/bin/k3s
+            get_checksum: true
+            checksum_algorithm: sha256
+          register: agent_k3s
+
+        - name: Fail if the checksums differ
+          ansible.builtin.assert:
+            that: agent_k3s.stat.checksum == server_k3s.stat.checksum
+            fail_msg: >-
+              k3s on {{ inventory_hostname }} ({{ agent_k3s.stat.checksum }}) does not match
+              {{ k3s_server_host }} ({{ server_k3s.stat.checksum }}). Do not install on top of this.
+            success_msg: "Binary matches the server node."
+
+    # Download to a file, then execute it — never `curl ... | sh -s -`. `sh -s`
+    # reads the script from stdin, so stdin IS the script: anything the installer
+    # runs that touches stdin parks the shell on a read that never returns. And if
+    # curl fails, sh gets empty input and exits 0, so Ansible reports success on an
+    # install that never happened.
+    - name: Download the k3s installer
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /root/k3s-install.sh
+        mode: "0755"
+        timeout: 60
+
+    - name: Run the k3s installer (agent)
+      ansible.builtin.command:
+        cmd: /root/k3s-install.sh
+        creates: /etc/systemd/system/k3s-agent.service
+      environment:
+        # With the binary already in place, skip the download entirely.
+        INSTALL_K3S_SKIP_DOWNLOAD: "{{ 'true' if server_k3s.stat.exists else 'false' }}"
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+        K3S_URL: "https://{{ k3s_api_host }}:6443"
+        K3S_TOKEN: "{{ hostvars[groups['k3s_server'][0]]['k3s_node_token'] }}"
+        INSTALL_K3S_EXEC: >-
+          agent
+          --node-name {{ node_hostname }}
+          {% for k, v in node_labels.items() %}--node-label {{ k }}={{ v }}{% if not loop.last %} {% endif %}{% endfor %}
+      no_log: true   # the join token would otherwise be echoed into the log
+
+- name: Verify
+  hosts: k3s_server
+  gather_facts: false
+  tasks:
+    - name: Both nodes Ready
+      ansible.builtin.command: k3s kubectl get nodes --no-headers
+      register: nodes
+      retries: 18
+      delay: 10
+      until: >
+        nodes.stdout_lines | length == 2 and
+        nodes.stdout_lines | select('search', ' Ready ') | list | length == 2
+      changed_when: false
+
+    - name: Show cluster state
+      ansible.builtin.debug:
+        var: nodes.stdout_lines

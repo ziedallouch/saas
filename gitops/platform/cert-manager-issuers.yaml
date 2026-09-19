@@ -1,0 +1,42 @@
+---
+# A two-step private CA. Step 1: a self-signed issuer whose only job is to sign the CA.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-bootstrap
+spec:
+  selfSigned: {}
+
+---
+# Step 2: the CA certificate itself. This is what the team installs in their trust
+# stores. Ten years, because rotating it means every developer re-imports it.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: erp-lan-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: ERP SaaS Internal CA
+  subject:
+    organizations: ["DevstyIT"]
+  secretName: erp-lan-ca-key-pair
+  duration: 87600h    # 10 years
+  renewBefore: 8760h  # 1 year
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned-bootstrap
+    kind: ClusterIssuer
+    group: cert-manager.io
+
+---
+# Step 3: the issuer every Ingress actually references.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: erp-ca
+spec:
+  ca:
+    secretName: erp-lan-ca-key-pair

@@ -1,0 +1,131 @@
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: erp-postgres
+  namespace: erp-data
+spec:
+  # One instance. Two VMs with node-local storage cannot give a replica anywhere
+  # useful — a second instance on node-2 would have its own unreplicated volume and
+  # a failover would silently lose data. One honest instance beats two dishonest ones.
+  instances: 1
+
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.2
+
+  # Pinned to the node that has the volume. Without this, a reschedule lands the pod
+  # on node-2 where the PVC does not exist, and it hangs Pending forever.
+  affinity:
+    nodeSelector:
+      erp.devsty.io/role: data
+
+  storage:
+    size: 20Gi
+    storageClass: local-path
+
+  # Sized for a 4 GB node that also carries k3s, the Keycloak database and Redis.
+  resources:
+    requests: { cpu: "250m", memory: "512Mi" }
+    limits:   { memory: "1Gi" }
+
+  postgresql:
+    parameters:
+      # PgBouncer fronts this in transaction mode, so the server itself needs far
+      # fewer slots than the app's apparent concurrency.
+      max_connections: "100"
+      # Roughly 25% of the container limit. Postgres also uses the page cache, so
+      # do not push this toward the limit — you starve the very cache it relies on.
+      shared_buffers: "256MB"
+      effective_cache_size: "512MB"
+      work_mem: "4MB"
+      # Log every statement that touches RLS during development. Turn down later.
+      log_statement: "ddl"
+      log_min_duration_statement: "500"
+
+  bootstrap:
+    initdb:
+      database: erp
+      owner: erp_migrator
+      secret:
+        name: erp-migrator-credentials
+      encoding: UTF8
+      localeCollate: en_US.utf8
+      localeCType: en_US.utf8
+
+      # Runs once, as superuser, in the `erp` database, immediately after initdb.
+      #
+      # erp_app is created NOLOGIN here so the grants below can reference it. The
+      # `managed.roles` block further down then gives it LOGIN and a password from a
+      # sealed secret — which is how the password stays out of git.
+      postInitApplicationSQL:
+        - CREATE ROLE erp_app NOLOGIN NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE;
+        - CREATE SCHEMA IF NOT EXISTS platform AUTHORIZATION erp_migrator;
+        - CREATE SCHEMA IF NOT EXISTS hr AUTHORIZATION erp_migrator;
+        - REVOKE ALL ON SCHEMA public FROM PUBLIC;
+        - GRANT USAGE ON SCHEMA platform TO erp_app;
+        - GRANT USAGE ON SCHEMA hr TO erp_app;
+        # Future tables created by the migrator become usable by the app automatically.
+        # Without this, every migration would need an explicit GRANT and one day someone
+        # forgets, and the failure looks like a bug in the app rather than a missing grant.
+        - ALTER DEFAULT PRIVILEGES FOR ROLE erp_migrator IN SCHEMA platform GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO erp_app;
+        - ALTER DEFAULT PRIVILEGES FOR ROLE erp_migrator IN SCHEMA hr GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO erp_app;
+        - ALTER DEFAULT PRIVILEGES FOR ROLE erp_migrator IN SCHEMA platform GRANT USAGE, SELECT ON SEQUENCES TO erp_app;
+        - ALTER DEFAULT PRIVILEGES FOR ROLE erp_migrator IN SCHEMA hr GRANT USAGE, SELECT ON SEQUENCES TO erp_app;
+        # Deliberately NOT granted: CREATE on any schema. The application must never be
+        # able to create a table, which is what keeps "the app runs migrations on boot"
+        # from becoming an option someone reaches for at 2am.
+
+  managed:
+    roles:
+      - name: erp_app
+        ensure: present
+        login: true
+        superuser: false
+        createdb: false
+        createrole: false
+        # The line the whole isolation model rests on. A role with BYPASSRLS reads every
+        # tenant's rows and every cross-tenant test still passes.
+        bypassrls: false
+        inherit: true
+        connectionLimit: -1
+        passwordSecret:
+          name: erp-app-credentials
+
+---
+# PgBouncer, in transaction pooling mode.
+#
+# This is why `SET LOCAL app.tenant_id` is mandatory throughout the codebase rather
+# than merely preferred: in transaction mode a plain SET persists on the physical
+# connection after the transaction ends, and the next borrower — very possibly another
+# tenant — inherits it.
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: erp-postgres-pooler-rw
+  namespace: erp-data
+spec:
+  cluster:
+    name: erp-postgres
+  instances: 1
+  type: rw
+  template:
+    spec:
+      nodeSelector:
+        erp.devsty.io/role: apps
+      containers:
+        - name: pgbouncer
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { memory: "256Mi" }
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "500"
+      default_pool_size: "25"
+      # Fail fast rather than queueing forever when the pool is exhausted; a hung
+      # request is harder to diagnose than a refused one.
+      query_wait_timeout: "10"
+
+# The operator creates the `cnpg_pooler_pgbouncer` role and the user_search auth
+# function in the cluster by itself. Verify once after first sync:
+#   kubectl -n erp-data exec -it erp-postgres-1 -- \
+#     psql -U postgres -d erp -c "\du cnpg_pooler_pgbouncer"

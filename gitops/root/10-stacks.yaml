@@ -1,0 +1,69 @@
+---
+# Cluster issuers. Wave -1: after cert-manager's CRDs, before anything wanting a cert.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-config
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ziedallouch/saas.git   # keep in sync with terraform.tfvars
+    targetRevision: main
+    path: gitops/platform
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cert-manager
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+
+---
+# Data stores. Wave 0.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: data
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ziedallouch/saas.git
+    targetRevision: main
+    path: gitops/data
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: erp-data
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    # Postgres bootstrap takes a while on first sync; do not let ArgoCD give up early.
+    retry:
+      limit: 10
+      backoff: { duration: 15s, factor: 2, maxDuration: 5m }
+
+---
+# Applications. Wave 1: Keycloak needs its database healthy first.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: apps
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ziedallouch/saas.git
+    targetRevision: main
+    path: gitops/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: erp-apps
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    retry:
+      limit: 10
+      backoff: { duration: 15s, factor: 2, maxDuration: 5m }

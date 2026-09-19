@@ -1,0 +1,41 @@
+---
+# Keycloak's own database, separate from the application database.
+#
+# Not a schema inside `erp`. Keycloak owns its schema entirely, migrates it on its own
+# upgrade cycle, and must never be reachable by erp_app. A separate CNPG cluster makes
+# that structural rather than a convention someone can break with one GRANT.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: keycloak-postgres
+  namespace: erp-data
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.2
+
+  affinity:
+    nodeSelector:
+      erp.devsty.io/role: data
+
+  storage:
+    size: 10Gi
+    storageClass: local-path
+
+  # Keycloak's store is small and barely written to after realm setup.
+  resources:
+    requests: { cpu: "100m", memory: "192Mi" }
+    limits:   { memory: "384Mi" }
+
+  postgresql:
+    parameters:
+      max_connections: "50"
+      shared_buffers: "96MB"
+      effective_cache_size: "192MB"
+
+  bootstrap:
+    initdb:
+      database: keycloak
+      owner: keycloak
+      secret:
+        name: keycloak-db-credentials
+      encoding: UTF8

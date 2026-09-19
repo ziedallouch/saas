@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+
+kubeconfig_path      = "../../kubeconfig"
+gitops_repo_url      = "https://github.com/ziedallouch/saas.git"
+gitops_repo_revision = "main"
+base_domain          = "erp.lan"
+
+# Private repo only. Use a read-only deploy token, not a personal one —
+# this value ends up in cluster state and in terraform.tfstate.
+# gitops_repo_username = "erp-deploy-bot"
+# gitops_repo_password = "ghp_..."
