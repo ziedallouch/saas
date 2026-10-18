@@ -1,0 +1,14 @@
+apiVersion: v2
+name: root-app
+description: >-
+  The ArgoCD root Application, as its own Helm release.
+
+  It cannot ship inside the argo-cd release: Helm resolves the kind of every
+  rendered manifest before applying any of them, and this chart's argoproj.io
+  CRDs live under templates/, not crds/. So "Application" is still an unknown
+  kind at that moment and the whole release fails with
+  "no matches for kind Application in version argoproj.io/v1alpha1".
+  Splitting it into a second release means the CRDs already exist by the time
+  this one is rendered.
+type: application
+version: 0.1.0

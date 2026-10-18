@@ -1,0 +1,4 @@
+# All three are supplied by terraform/bootstrap/main.tf (helm_release.root_app).
+namespace: argocd
+repoURL: ""
+targetRevision: main
