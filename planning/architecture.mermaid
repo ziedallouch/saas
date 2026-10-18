@@ -1,0 +1,107 @@
+flowchart TB
+    subgraph Client["Clients"]
+        Browser["Tenant Portal (SPA)"]
+        AdminUI["Admin Portal\nplatform staff\nno tenant_id, platform role"]
+    end
+
+    subgraph K8s["Kubernetes Cluster"]
+        Ingress["Ingress + cert-manager (TLS)"]
+
+        subgraph Identity["Identity - PURE IdP"]
+            Keycloak["Keycloak (OIDC/OAuth2)\nSingle realm, tenant = GROUP\ntenant_id = group attribute\nIssues: tenant_id + PLATFORM roles only\nNo tenant roles, no permissions"]
+            KcDB[("Keycloak DB\nPostgreSQL")]
+        end
+
+        Gateway["API Gateway / BFF\n1. Verify JWT vs cached JWKS (local)\n2. REJECT if tenant_id missing\n3. Resolve entitlements from Redis\n4. Forward as trusted request context"]
+
+        Redis[("Redis\nEntitlement cache: active FEATURE set\nPermission cache: user effective perms\nTTL 30-60s")]
+
+        RBAC["Permission Resolution\nuser -> tenant roles -> permissions\nRoles in APP DB, not Keycloak\nUNIQUE (tenant_id, name)"]
+        Nav["GET /api/me/navigation\nentitlement INTERSECT permissions\nlocked = greyed + upgrade prompt\nno permission = omitted entirely"]
+        Manifest["Module manifest migration\nversioned file in repo\nvalidates prerequisites\nnew features entitled to NOBODY"]
+        AdminPath["Admin data path\nno tenant_id -> RLS denies\ncontext set explicitly + logged"]
+
+        subgraph Services["Core Services"]
+            Tenant["Tenant Service\nlifecycle + provisioning"]
+            Catalog["Catalog Service\nModules, Features, prerequisites\nfed by manifest migration"]
+            Pack["Pack Service\nPackFeature + audit\nimpact preview"]
+            Sub["Subscription Service"]
+            Billing["Billing Service"]
+            Notif["Notification Service"]
+            Sched["Scheduler\nCHECKS ENTITLEMENT\nbefore dispatch"]
+        end
+
+        subgraph ERP["Pluggable ERP Modules"]
+            Acct["Accounting"]
+            HR["HR"]
+            Inv["Inventory"]
+            CRM["CRM"]
+        end
+
+        TRL["Tenant Resolution Layer\nreads tenant_id from context\nbranches on isolation_mode\nsets app.tenant_id session var"]
+
+        Broker[["Message Broker\n(Kafka / RabbitMQ)"]]
+        PgB["PgBouncer\nconnection pooling"]
+        AppDB[("Shared PostgreSQL\nsingle DB + tenant_id column\nROW-LEVEL SECURITY enforced\n+ Role / RolePermission / UserRole\nscope: self | department | tenant")]
+        FutureDB[("Dedicated DB per tenant\nFUTURE - enterprise tier\nisolation_mode = dedicated")]
+
+        subgraph Observability["Observability"]
+            Prom["Prometheus / Grafana"]
+            Logs["Loki / ELK"]
+            Trace["Jaeger / Tempo"]
+        end
+    end
+
+    Stripe["Payment Provider\n(Stripe)"]
+
+    Browser --> Ingress
+    AdminUI --> Ingress
+    Ingress --> Gateway
+    Gateway -. "JWKS keys cached\n(no per-request call)" .-> Keycloak
+    Keycloak --> KcDB
+    Gateway -- "1 read per request" --> Redis
+
+    Gateway --> Tenant
+    Gateway --> Catalog
+    Gateway --> Pack
+    Gateway --> Sub
+    Gateway --> Billing
+    Gateway --> ERP
+
+    Manifest --> Catalog
+    AdminUI -. "audited admin API\nnever impersonates tenant user" .-> AdminPath
+    AdminPath --> TRL
+    Gateway --> Nav
+    Nav --> RBAC
+    RBAC --> Redis
+    RBAC --> TRL
+    ERP -- "@RequirePermission guard\nchecks forwarded context" --> RBAC
+
+    Tenant --> TRL
+    Catalog --> TRL
+    Pack --> TRL
+    Sub --> TRL
+    Billing --> TRL
+    ERP --> TRL
+    Sched --> TRL
+
+    TRL --> PgB
+    PgB --> AppDB
+    TRL -.-> FutureDB
+
+    Sub -- "subscription.changed\nBUSTS Redis key" --> Broker
+    Broker -- "invalidate" --> Redis
+    Sub -- "cache miss fallback" --> Redis
+
+    Billing -- "events" --> Broker
+    Tenant -- "events" --> Broker
+    Broker --> Notif
+    Broker --> ERP
+
+    Tenant -- "create group + admin user\n(no DB provisioning)" --> Keycloak
+    Billing <--> Stripe
+
+    Services -.-> Prom
+    ERP -.-> Prom
+    Services -.-> Logs
+    Services -.-> Trace

@@ -6,14 +6,28 @@ Read `docs/CURRENT_STATE.md` first — it holds what is done, what remains, and 
 failure modes already hit. `README.md` holds the design decisions and the reasons
 behind them; do not re-open those while building infrastructure.
 
+## Repository layout
+
+One repo holds the whole project. `gitops/` must stay at the root — every ArgoCD
+`path:` and the `gitops_repo_url` in `terraform.tfvars` depend on it. Do not move it
+into a subfolder.
+
+| Path | What |
+|---|---|
+| `gitops/` `terraform/` `ansible/` `scripts/` | infrastructure |
+| `app/` | NestJS + Angular application code (empty so far) |
+| `planning/` | Task_Plan, Server_Architecture, documentation, QUESTIONS |
+| `docs/CURRENT_STATE.md` | where the cluster build actually stands |
+| `.claude/skills/next-task/` | the task runner |
+
 ## Where this runs
 
 The repo lives on a Windows host but **every tool runs inside WSL2 Ubuntu**:
 
 | | |
 |---|---|
-| Windows path | `D:\NP\erp-deploy` |
-| WSL path | `/mnt/d/NP/erp-deploy` |
+| Windows path | `D:\NP\erp-deploy` **on the original machine** — it is a clone of `git@github.com:ziedallouch/saas.git` and may sit anywhere else |
+| WSL path | the same path under `/mnt/<drive>/…` |
 | Toolchain | ansible, terraform, kubectl, helm, kubeseal — WSL only, none on Windows |
 | SSH key | `~/.ssh/id_ed25519` **inside WSL** (files on `/mnt/d` report mode 0777, and SSH refuses world-readable keys) |
 
@@ -52,7 +66,7 @@ Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*Fortinet*" }
 There is no build or test suite; the checks are per-tool.
 
 ```bash
-export KUBECONFIG=/mnt/d/NP/erp-deploy/kubeconfig   # per-shell, set it in every window
+export KUBECONFIG=$PWD/kubeconfig   # from the repo root; per-shell, set it in every window
 ```
 
 `kubectl` failing with `localhost:8080 connection refused` means this variable is unset
