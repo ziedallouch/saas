@@ -1,6 +1,6 @@
 # ERP SaaS — Cluster Build: Current State
 
-**Updated:** 2026-09-19 (node-2 joined)
+**Updated:** 2026-10-18 (bootstrap applied; one change still pending, see §4)
 **Purpose:** where the non-production cluster build stands, what remains, and the
 things already learned the hard way. Read `AGENT_PROMPT.md` next if you are handing
 this to someone (or something) else to continue.
@@ -79,16 +79,30 @@ Both RHEL-family, cloned from one template, reachable over SSH as `root` with ke
 - [x] `k3s-selinux` installed on node-2 to match node-1 (see §8, it is not automatic)
 - [x] Agent play in `ansible/site.yml` rewritten: copies the binary from node-1 with a
       sha256 assert, `INSTALL_K3S_SKIP_DOWNLOAD=true`, no `curl … | sh`
+- [x] **Git remote** — `git@github.com:ziedallouch/saas.git`, pushed, URL consistent in
+      `terraform.tfvars` and `gitops/root/10-stacks.yaml`. Pushes go over **SSH from WSL**
+      (`~/.ssh/id_ed25519_github`); Windows git cannot push, see §8
+- [x] **`terraform apply` succeeded** — 4 namespaces, Sealed Secrets 2.16.2 (pod Running),
+      ArgoCD 7.7.11 (4 components on node-2), `argoproj.io` CRDs, root Application created
+- [x] Three upstream/bootstrap defects found and fixed in code (§8), committed as `e655b4e`
+- [x] `CLAUDE.md` added at the repo root
 
 ## 4. Not done
 
-- [ ] **Git remote created, repo pushed, repo URL updated in the three places below** —
-      this is the immediate blocker, and it needs a URL from the operator
-- [ ] `terraform apply` in `terraform/bootstrap` (ArgoCD + Sealed Secrets + root Application)
-- [ ] Credentials sealed and committed
-- [ ] ArgoCD sync: cert-manager, ingress-nginx, CNPG, Postgres ×2, Redis, Keycloak
+- [ ] **`applicationSet.replicas = 0` is committed but never applied.** The apply was cut
+      off by a VPN drop mid-`helm upgrade`. **Before retrying, check
+      `helm -n argocd status argocd`** — a release interrupted during upgrade can sit in
+      `pending-upgrade`, which makes every later apply fail with a misleading message and
+      needs a `helm rollback` to clear. Until this lands, the ApplicationSet controller
+      runs with **no requests and no limits** on node-2
+- [ ] Root Application last seen `SYNC STATUS: Unknown` — `argocd-repo-server` was still
+      `0/1` and had not cloned the repo yet. Unconfirmed since
+- [ ] Credentials sealed and committed (5 SealedSecrets, `README.md` → "Secrets")
+- [ ] ArgoCD sync: cert-manager, ingress-nginx, CNPG, Postgres ×2, Redis, Keycloak —
+      **none of these has ever been deployed**
 - [ ] Private CA distributed, hosts entries added
-- [ ] Verification checks (§7)
+- [ ] Verification checks (§7) — **never run.** `erp_app` does not exist yet, so the
+      `rolbypassrls` check is a design target, not an observed fact
 
 ---
 
@@ -120,34 +134,31 @@ path automatically and both nodes are guaranteed byte-identical.
 
 ---
 
-## 5a. Immediate next step — the git remote
+## 5a. Immediate next step — finish the interrupted apply
 
-Everything after this point needs a repository URL, and it must be reachable **from
-inside the VMs**, because ArgoCD clones it from the cluster and not from the workstation.
-Do not invent one; ask. Then update it in both places, which must agree:
+The VPN must be up first; `Ethernet 3` reading `Disconnected` is why the cluster is
+unreachable, not a cluster fault.
 
-- `terraform/bootstrap/terraform.tfvars` → `gitops_repo_url`
-- `gitops/root/10-stacks.yaml` → three `repoURL:` lines
-
-If they disagree the root Application reports Healthy while its children never appear.
+```bash
+helm -n argocd status argocd        # FIRST. If it says pending-upgrade, stop and read §4.
+cd terraform/bootstrap && terraform plan -out=/tmp/bs.tfplan && terraform apply /tmp/bs.tfplan
+kubectl -n argocd get deploy argocd-applicationset-controller   # expect 0/0
+kubectl -n argocd get app                                       # root should reach Synced
+```
 
 ---
 
 ## 6. Remaining sequence after that
 
-1. **Git remote.** Create an empty repo, then push `erp-deploy`. ArgoCD clones it from
-   *inside* the cluster, so it must be reachable from the VMs.
-2. **Update the repo URL in three places** — they must agree, or the root Application
-   goes Healthy while its children never appear:
-   - `terraform/bootstrap/terraform.tfvars` → `gitops_repo_url`
-   - `gitops/root/10-stacks.yaml` → three `repoURL:` lines
-3. **`terraform apply`** in `terraform/bootstrap`. Installs Sealed Secrets and ArgoCD,
-   and ships the root Application through the chart's `extraObjects`.
-4. **Seal the credentials** — procedure in `README.md`, "Secrets". Five SealedSecrets;
+1. **Seal the credentials** — procedure in `README.md`, "Secrets". Five SealedSecrets;
    `keycloak-db-credentials` is needed in **two** namespaces with the **same** password.
-   Back up the Sealed Secrets controller key; it cannot be rebuilt from git.
-5. **Let ArgoCD sync.** Expect this to be slow (§8).
-6. **Distribute the CA** and add hosts entries for `argocd`/`keycloak`/`api.erp.lan`.
+   Record each generated password in a password manager as you go: it cannot be read back
+   out of a SealedSecret. Back up the Sealed Secrets controller key; it cannot be rebuilt
+   from git.
+2. **Let ArgoCD sync, staged.** ~1.5 GB of image pulls on a slow link. Bring up
+   cert-manager and ingress-nginx first, then CNPG and the databases, then Keycloak.
+3. **Distribute the CA** and add hosts entries for `argocd`/`keycloak`/`api.erp.lan`.
+4. **Run the §7 checks**, `erp_app` → `rolbypassrls = f` above all.
 
 ---
 
@@ -222,6 +233,48 @@ never run. Before retrying anything remote, look at what the previous attempt re
 left behind (`ls -l`, the log file, `systemctl is-active`), because a half-finished
 step and a not-started step need different handling.
 
+**A pinned version does not pin the source.** The Sealed Secrets chart repo
+`bitnami-labs.github.io/sealed-secrets` now 404s on `index.yaml` — the project moved to
+`bitnami/sealed-secrets`, and Helm reports it as "not a valid chart repository or cannot
+be reached". Same chart and same pinned 2.16.2 at `https://bitnami.github.io/sealed-secrets`.
+
+**A Helm value that does not exist is accepted in silence.** `applicationSet.enabled` has
+no meaning in argo-cd chart 7.7.11; `helm template --set applicationSet.enabled=false`
+renders the controller exactly as `=true` does. `dex.enabled` and `notifications.enabled`
+are real, which is what made the difference invisible — those two pods were correctly
+absent while the ApplicationSet controller ran with **no requests and no limits at all**.
+`replicas = 0` is the supported way off. When a component you disabled is still running,
+check the key exists before assuming the cluster is wrong.
+
+**The root Application cannot ship inside the argo-cd release.** Helm resolves the kind of
+every rendered manifest *before* applying any of them, and this chart keeps its
+`argoproj.io` CRDs under `templates/`, not `crds/`. So `Application` is an unknown kind at
+mapping time, the entire release is rejected, **nothing is applied, and retrying never
+helps** — the CRDs the retry needs are in the release that keeps failing. It is now a
+second tiny release, `terraform/bootstrap/charts/root-app`. Do not merge it back in.
+`kubernetes_manifest` does not work either: it dry-runs at *plan* time.
+
+**`helm_release` holds one connection open for the whole install when `wait = true`.**
+ArgoCD is ~816 MB of images here, and the apply died with `http2: client connection lost`.
+`wait = false` submits the manifests and returns, so the pulling happens inside the
+cluster where the workstation's VPN is irrelevant. The cost is that Terraform no longer
+confirms ArgoCD is healthy — check it separately with `kubectl rollout status`.
+
+**Identical failures are not network failures.** Five applies failed at the same step,
+after the same ~40 seconds, with the same message. That consistency ruled the VPN out and
+pointed at a deterministic cause. The opposite shape — `dial tcp … i/o timeout`, failing
+everywhere at once — is the VPN. A hypothesis worth testing cheaply: a 266 KB POST with
+`--dry-run=server` creates nothing and proves whether large writes survive the tunnel.
+Here they did, which refuted the HTTP/2 and MTU theories.
+
+**Push from WSL, not from Windows.** The GitHub SSH key lives in WSL
+(`~/.ssh/id_ed25519_github`). Windows git fails with `Host key verification failed`, and
+over HTTPS it fails differently again: Git Credential Manager cannot prompt from a
+non-interactive shell (`/dev/tty: No such device`). Note also that
+`http.sslVerify=false` is set in the workstation's global `.gitconfig`, so every git
+HTTPS connection on that machine is unverified — a VPN TLS-interception workaround worth
+replacing with a proper CA.
+
 **Guard patterns can match themselves.** `pgrep -f "k3s-install.sh"` matched the very
 `bash -c` that carried the pattern, so the "is an installer already running?" check
 reported yes on an idle node. Write it as `[k]3s-install\.sh` — the running command
@@ -249,5 +302,12 @@ Keycloak's heap is capped explicitly at 768 MB. Do not remove that and let
 limit, then metaspace and thread stacks push the process over it, and it surfaces as an
 OOMKill with no heap error in the logs.
 
-ArgoCD runs without dex, notifications and applicationset. Re-enabling any of them costs
-150–250 MB that node-2 does not have spare.
+ArgoCD runs without dex and notifications. The ApplicationSet controller is switched off
+with `replicas = 0`, **not** with an `enabled` flag — that flag does not exist in chart
+7.7.11 (§8). Re-enabling any of the three costs 150–250 MB that node-2 does not have spare.
+
+Measured on node-2 with ArgoCD running and nothing else deployed yet: **608 Mi requests,
+1216 Mi limits** out of 3693 Mi allocatable. The ArgoCD limits above (816 MB) understate
+what the chart actually sets — the four components come to 1216 Mi. Everything still to
+be placed on node-2 (Keycloak, ingress-nginx, cert-manager, cnpg, pgbouncer) has to fit
+in what is left, so verify before adding anything unsized.
