@@ -25,21 +25,35 @@ careless with — adding an unsized workload will start evicting things.
 | node-1 | limit | | node-2 | limit |
 |---|---|---|---|---|
 | k3s server | ~600 MB | | k3s agent | ~350 MB |
-| erp-postgres | 1024 MB | | ArgoCD (4 components) | 816 MB |
+| erp-postgres | 1024 MB | | ArgoCD (4 components) | 1216 MB |
 | keycloak-postgres | 384 MB | | Keycloak | 1280 MB |
 | redis | 256 MB | | ingress-nginx | 256 MB |
 | | | | cert-manager ×3 | 384 MB |
 | | | | cnpg-operator | 192 MB |
 | | | | pgbouncer | 256 MB |
-| **total** | **~2.3 GB** | | **total** | **~3.5 GB** |
+| **total** | **~2.3 GB** | | **total** | **~3.9 GB** |
+
+The ArgoCD figure is measured, not estimated: with ArgoCD running and nothing else
+deployed, node-2 reports **608 Mi of requests and 1216 Mi of limits** out of 3693 Mi
+allocatable. The node-2 limits column therefore oversubscribes the node. That is
+deliberate — limits are a ceiling, requests are what the scheduler places on — but it
+means an unsized pod has nothing to take from. Every workload here sets requests and
+limits; keep it that way.
 
 Keycloak is over half of node-2. Its heap is capped explicitly at 768 MB rather than
 left to `MaxRAMPercentage`, because the JVM's container default takes ~70% of the limit
 for heap alone and then overruns it with metaspace and thread stacks — which shows up as
 an OOMKill with no heap error, and costs an afternoon to diagnose.
 
-ArgoCD runs without dex, notifications and applicationset. Turning any of them back on
-costs 150–250 MB that node-2 does not have spare.
+ArgoCD runs without dex, notifications and the ApplicationSet controller. Turning any of
+them back on costs 150–250 MB that node-2 does not have spare.
+
+The first two are switched off with `enabled = false`. The third is not: **chart 7.7.11
+has no `applicationSet.enabled` key**, and setting one is accepted and silently ignored —
+`helm template --set applicationSet.enabled=false` renders the controller exactly as
+`=true` does. It ran here unnoticed, with no requests and no limits at all, because dex
+and notifications *were* correctly absent and the configuration looked right. It is off
+via `replicas = 0`. If you bump the chart version, re-check this.
 
 ## Tooling split, and why
 
@@ -89,6 +103,28 @@ over plain HTTP, so TLS is not optional even internally.
 **Sealed Secrets.** Works with no cloud and no Vault. Note the limitation now rather than
 later: rotating the context-envelope HMAC (`Server_Architecture.md` §3.1) means
 re-sealing and committing, which is a deploy, not an operation. Revisit at production.
+Its chart now comes from `https://bitnami.github.io/sealed-secrets`; the project moved
+out of `bitnami-labs/` and the old Pages URL 404s on `index.yaml`, which Helm reports as
+"not a valid chart repository".
+
+**The root Application is its own Helm release** (`terraform/bootstrap/charts/root-app`),
+not an `extraObjects` entry on the argo-cd release. This is forced, not stylistic. Helm
+resolves the kind of every rendered manifest before applying any of them, and the argo-cd
+chart keeps its `argoproj.io` CRDs under `templates/` rather than `crds/` — so an
+`Application` in that same release is an unknown kind at mapping time, the whole release
+is rejected, nothing is applied, and retrying cannot help because the CRDs it needs are
+in the release that keeps failing. `kubernetes_manifest` fails too, for a different
+reason: it dry-runs at *plan* time, before the cluster has the CRD.
+
+**ArgoCD installs with `wait = false`.** Its images are ~816 MB, and `helm_release` holds
+one connection open for the whole install when it waits — which fails on a slow or flaky
+link with `http2: client connection lost`. Submitting the manifests and returning lets the
+pulling happen inside the cluster. The trade-off is that `terraform apply` succeeding no
+longer means ArgoCD is healthy; check that yourself:
+
+```bash
+kubectl -n argocd rollout status deploy/argocd-server --timeout=30m
+```
 
 ---
 
@@ -181,7 +217,8 @@ On Windows that file is `C:\Windows\System32\drivers\etc\hosts`, edited as admin
 
 ## Secrets
 
-Four secrets must exist before the data layer becomes healthy. Generate, seal, commit:
+Five secrets must exist before the data layer becomes healthy — **six files**, because
+`keycloak-db-credentials` is sealed once per namespace. Generate, seal, commit:
 
 ```bash
 kubeseal --fetch-cert > sealed-secrets.pem   # once
