@@ -18,7 +18,8 @@ into a subfolder.
 | `app/` | NestJS + Angular application code (empty so far) |
 | `planning/` | Task_Plan, Server_Architecture, documentation, QUESTIONS |
 | `docs/CURRENT_STATE.md` | where the cluster build actually stands |
-| `.claude/skills/next-task/` | the task runner |
+| `.claude/skills/next-task/` | the task runner — reads the plan, dispatches by role |
+| `.claude/agents/` | `infra` and `backend`. They point here for the rules rather than copying them, so there is one copy to keep true |
 
 ## Where this runs
 

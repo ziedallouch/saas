@@ -58,6 +58,28 @@ pick first [ ] task  →  classify  →  act  →  verify  →  tick  →  commi
 Design decisions already locked are in the "Decisions locked in" table at the top of
 `Task_Plan.md`. Do not re-open them, and do not ask about them.
 
+### Dispatch
+
+You are the orchestrator. Send the task to the agent that owns that ground:
+
+| Task touches | Agent |
+|---|---|
+| `gitops/` `terraform/` `ansible/` `scripts/`, the VMs, the cluster | `infra` |
+| `app/` backend: NestJS, schema, migrations, RLS, entitlement, backend tests | `backend` |
+| Angular, portals, UI | no agent yet — do it yourself, or add a `frontend` agent when Phase 7 is near |
+| plan, docs, questions, small edits | do it yourself; spawning an agent costs more than the task |
+
+Two rules on dispatch:
+
+- **Never run two agents that touch the cluster.** `infra` runs alone. `backend` and a
+  future `frontend` may run together, because they share no state.
+- **Agents cannot ask the user.** When one comes back saying it needs a decision or an
+  approval — `terraform apply`, `helm upgrade`, anything destructive — *you* handle it:
+  park the question in `planning/QUESTIONS.md`, or put the prepared plan to the user and
+  wait. Do not re-dispatch the same task hoping it goes through.
+
+Each agent reports to you, not to the user. Relay what matters in your own report.
+
 ### Act
 
 - Application code → `app/` (NestJS + Angular). Infrastructure → the repo root.
